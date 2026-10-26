@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure CN6 checkpoint parameters, memory, and end-to-end inference latency."""
+"""Measure five-method CN6 inference, model, memory, and communication cost."""
 
 from __future__ import annotations
 
@@ -12,148 +12,254 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.envs.cooperative_navigation import CooperativeNavigation
-from src.envs.entity_observation import MPEEntityObservationAdapter
-from src.models.match_agent import MATCHAgent
-from src.models.match_information_hub import MATCHInformationHub
-from src.runners.match_episode_runner import MATCHEpisodeRunner
+from evaluate_cn6_checkpoint import (
+    METHOD_LABELS,
+    build_runner,
+    resolve_packet_loss,
+    resolve_sight_range,
+    validate_checkpoint,
+)
+
+
+METHODS = tuple(METHOD_LABELS)
+FLOAT_BYTES = 4
 
 
 def state_dict_elements(state_dict: dict) -> int:
     return sum(value.numel() for value in state_dict.values() if torch.is_tensor(value))
 
 
-def count_parameters(module: torch.nn.Module) -> int:
+def module_parameters(module: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters())
+
+
+def masia_active_parameters(module: torch.nn.Module) -> int:
+    """Parameters reached by MASIAAgent.forward during decentralized execution."""
+    inactive_prefixes = (
+        "projection.",
+        "predictor.",
+        "target_encoder.",
+        "target_projection.",
+    )
+    return sum(
+        parameter.numel()
+        for name, parameter in module.named_parameters()
+        if not name.startswith(inactive_prefixes)
+    )
+
+
+def parameter_accounting(method: str, checkpoint: dict, runner) -> dict[str, int]:
+    if method == "qmix":
+        resident = module_parameters(runner.agent_network)
+        active = resident
+        training = (
+            state_dict_elements(checkpoint["agent_network"])
+            + state_dict_elements(checkpoint.get("mixer", {}))
+        )
+    elif method == "masia":
+        resident = module_parameters(runner.agent_network)
+        active = masia_active_parameters(runner.agent_network)
+        training = (
+            state_dict_elements(checkpoint["agent_network"])
+            + state_dict_elements(checkpoint.get("mixer", {}))
+            + state_dict_elements(checkpoint.get("latent_model", {}))
+        )
+    else:
+        resident = (
+            module_parameters(runner.match_agent)
+            + module_parameters(runner.information_hub)
+        )
+        active = resident
+        training = resident + state_dict_elements(checkpoint.get("mixer", {}))
+
+    checkpoint_elements = sum(
+        state_dict_elements(value)
+        for value in checkpoint.values()
+        if isinstance(value, dict)
+    )
+    return {
+        "execution_parameter_count": resident,
+        "active_execution_parameter_count": active,
+        "online_training_parameter_elements": training,
+        "checkpoint_parameter_elements": checkpoint_elements,
+    }
+
+
+def communication_for_episode(
+    method: str,
+    episode: dict,
+    statistics: dict,
+    runner,
+) -> dict[str, float]:
+    """Apply one documented logical-wire accounting model.
+
+    MATCH-family: six agent-to-Hub uplinks and six personalized 32-float
+    Hub-to-agent messages per step. A fixed uplink carries the 12 x 8 entity
+    tensor. MASIA: expand every sender broadcast into five receiver deliveries,
+    each carrying one local observation. QMIX: no execution-time messages.
+    """
+    steps = int(statistics["episode_length"])
+    if method == "qmix":
+        return {
+            "steps": steps,
+            "attempted_messages": 0.0,
+            "delivered_messages": 0.0,
+            "attempted_bytes": 0.0,
+            "delivered_bytes": 0.0,
+        }
+
+    n_agents = int(runner.n_agents)
+    if method == "masia":
+        masks = np.asarray(episode["packet_loss_masks"][:steps], dtype=np.float64)
+        receivers = n_agents - 1
+        attempted_messages = float(steps * n_agents * receivers)
+        delivered_messages = float(masks.sum() * receivers)
+        payload_floats = int(runner.observation_dim)
+        return {
+            "steps": steps,
+            "attempted_messages": attempted_messages,
+            "delivered_messages": delivered_messages,
+            "attempted_bytes": attempted_messages * payload_floats * FLOAT_BYTES,
+            "delivered_bytes": delivered_messages * payload_floats * FLOAT_BYTES,
+        }
+
+    attempted_uplinks = int(statistics["attempted_packets"])
+    delivered_uplinks = int(statistics["received_packets"])
+    downlinks = steps * n_agents
+    uplink_floats = int(runner.n_entities * runner.entity_observation_dim)
+    downlink_floats = int(runner.match_agent.reconstructed_entity_dim)
+    return {
+        "steps": steps,
+        "attempted_messages": float(attempted_uplinks + downlinks),
+        "delivered_messages": float(delivered_uplinks + downlinks),
+        "attempted_bytes": float(
+            (attempted_uplinks * uplink_floats + downlinks * downlink_floats)
+            * FLOAT_BYTES
+        ),
+        "delivered_bytes": float(
+            (delivered_uplinks * uplink_floats + downlinks * downlink_floats)
+            * FLOAT_BYTES
+        ),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--method", required=True, choices=METHODS)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--warmup-episodes", type=int, default=20)
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--seed", type=int, default=40000)
-    parser.add_argument("--packet-loss", type=float, default=0.3)
+    parser.add_argument("--packet-loss", type=float, default=None)
+    parser.add_argument("--sight-range", type=float, default=None)
+    parser.add_argument("--expected-checkpoint-episode", type=int, default=100000)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
-    if not 0.0 <= args.packet_loss <= 1.0:
-        raise ValueError("packet loss must be between 0 and 1")
+    if args.episodes <= 0 or args.warmup_episodes < 0:
+        raise ValueError("episode counts are invalid")
 
     device = torch.device("cuda:0")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    training_arguments = checkpoint.get("arguments", {})
-    saved_sight_range = training_arguments.get("sight_range", -1.0)
-    sight_range = None if saved_sight_range < 0.0 else saved_sight_range
-
-    n_agents = 6
-    n_landmarks = 6
-    n_entities = 12
-    max_steps = 25
-
-    env = CooperativeNavigation(
-        n_agents=n_agents,
-        max_cycles=max_steps,
-        occupancy_radius=0.3,
+    checkpoint_path = Path(args.checkpoint)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    training_arguments = validate_checkpoint(
+        args.method,
+        checkpoint,
+        checkpoint_path,
+        args.expected_checkpoint_episode,
     )
-    env.reset(seed=args.seed)
-    n_actions = env.action_space(env.possible_agents[0]).n
-    entity_adapter = MPEEntityObservationAdapter(
-        n_agents=n_agents,
-        n_landmarks=n_landmarks,
-        sight_range=sight_range,
+    sight_range = resolve_sight_range(training_arguments, args.sight_range)
+    packet_loss = resolve_packet_loss(args.method, training_arguments, args.packet_loss)
+    env, runner = build_runner(
+        args.method,
+        checkpoint,
+        training_arguments,
+        device,
+        sight_range,
+        packet_loss,
     )
-    information_hub = MATCHInformationHub(
-        n_entities=n_entities,
-        observation_dim=8,
-        embedding_dim=32,
-        state_dim=8,
-        history_length=4,
-    ).to(device)
-    match_agent = MATCHAgent(
-        n_agents=n_agents,
-        n_entities=n_entities,
-        entity_observation_dim=8,
-        hidden_dim=32,
-        query_dim=32,
-        reconstructed_entity_dim=32,
-        n_actions=n_actions,
-        use_local_belief=bool(training_arguments.get("use_local_belief", False)),
-        belief_hidden_dim=int(training_arguments.get("belief_hidden_dim", 32)),
-        belief_state_dim=8,
-        fuse_local_belief=not bool(training_arguments.get("disable_belief_fusion", False)),
-        use_belief_history=not bool(training_arguments.get("disable_belief_history", False)),
-    ).to(device)
-    match_agent.load_state_dict(checkpoint["match_agent"])
-    information_hub.load_state_dict(checkpoint["information_hub"])
-    match_agent.eval()
-    information_hub.eval()
-
-    runner = MATCHEpisodeRunner(
-        env=env,
-        match_agent=match_agent,
-        information_hub=information_hub,
-        entity_adapter=entity_adapter,
-        device=device,
-        packet_loss=args.packet_loss,
-    )
+    parameters = parameter_accounting(args.method, checkpoint, runner)
 
     with torch.inference_mode():
-        for episode in range(args.warmup_episodes):
-            runner.run(epsilon=0.0, seed=args.seed + episode)
+        for episode_index in range(args.warmup_episodes):
+            runner.run(epsilon=0.0, seed=args.seed + episode_index)
 
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
-    episode_times = []
-    pols = []
-    returns = []
+    episode_times: list[float] = []
+    pols: list[float] = []
+    returns: list[float] = []
+    communication = {
+        "steps": 0.0,
+        "attempted_messages": 0.0,
+        "delivered_messages": 0.0,
+        "attempted_bytes": 0.0,
+        "delivered_bytes": 0.0,
+    }
 
-    with torch.inference_mode():
-        for episode in range(args.episodes):
-            torch.cuda.synchronize(device)
-            start = time.perf_counter()
-            _, statistics = runner.run(
-                epsilon=0.0,
-                seed=args.seed + args.warmup_episodes + episode,
-            )
-            torch.cuda.synchronize(device)
-            episode_times.append(time.perf_counter() - start)
-            pols.append(float(statistics["pol"]))
-            returns.append(float(statistics["episode_return"]))
+    try:
+        with torch.inference_mode():
+            for episode_index in range(args.episodes):
+                torch.cuda.synchronize(device)
+                start = time.perf_counter()
+                episode_data, statistics = runner.run(
+                    epsilon=0.0,
+                    seed=args.seed + args.warmup_episodes + episode_index,
+                )
+                torch.cuda.synchronize(device)
+                episode_times.append(time.perf_counter() - start)
+                pols.append(float(statistics["pol"]))
+                returns.append(float(statistics["episode_return"]))
+                episode_comm = communication_for_episode(
+                    args.method, episode_data, statistics, runner
+                )
+                for key in communication:
+                    communication[key] += float(episode_comm[key])
+    finally:
+        env.close()
 
     elapsed = float(sum(episode_times))
-    episode_times_ms = np.asarray(episode_times, dtype=float) * 1000.0
-    method = "db_all" if match_agent.use_local_belief else "match"
-    execution_parameters = count_parameters(match_agent) + count_parameters(information_hub)
-    mixer_elements = state_dict_elements(checkpoint["mixer"])
-    online_training_elements = execution_parameters + mixer_elements
+    episode_times_ms = np.asarray(episode_times, dtype=np.float64) * 1000.0
+    total_steps = communication["steps"]
+    if total_steps <= 0:
+        raise RuntimeError("The benchmark executed no environment steps")
 
     report = {
-        "method": method,
-        "checkpoint": args.checkpoint,
+        "status": "succeeded",
+        "method": args.method,
+        "method_label": METHOD_LABELS[args.method],
+        "checkpoint": str(checkpoint_path),
         "checkpoint_episode": int(checkpoint["episode"]),
         "training_seed": int(training_arguments.get("seed", -1)),
         "warmup_episodes": args.warmup_episodes,
         "timed_episodes": args.episodes,
-        "steps_per_episode": max_steps,
-        "packet_loss": args.packet_loss,
+        "total_environment_steps": int(total_steps),
+        "packet_loss": packet_loss,
+        "sight_range": sight_range,
         "total_timed_seconds": elapsed,
         "mean_episode_latency_ms": float(episode_times_ms.mean()),
         "median_episode_latency_ms": float(np.median(episode_times_ms)),
         "p95_episode_latency_ms": float(np.percentile(episode_times_ms, 95)),
-        "mean_end_to_end_step_latency_ms": float(episode_times_ms.mean() / max_steps),
+        "mean_end_to_end_step_latency_ms": elapsed / total_steps * 1000.0,
         "episodes_per_second": args.episodes / elapsed,
-        "environment_steps_per_second": args.episodes * max_steps / elapsed,
+        "environment_steps_per_second": total_steps / elapsed,
         "peak_inference_cuda_allocated_mb": torch.cuda.max_memory_allocated(device) / 1024**2,
         "peak_inference_cuda_reserved_mb": torch.cuda.max_memory_reserved(device) / 1024**2,
-        "execution_parameter_count": execution_parameters,
-        "mixer_parameter_elements": mixer_elements,
-        "online_training_parameter_elements": online_training_elements,
+        **parameters,
+        "attempted_messages_per_step": communication["attempted_messages"] / total_steps,
+        "delivered_messages_per_step": communication["delivered_messages"] / total_steps,
+        "attempted_communication_kib_per_episode": communication["attempted_bytes"] / args.episodes / 1024.0,
+        "delivered_communication_kib_per_episode": communication["delivered_bytes"] / args.episodes / 1024.0,
         "mean_pol": float(np.mean(pols)),
         "mean_return": float(np.mean(returns)),
         "gpu_name": torch.cuda.get_device_name(device),
+        "communication_accounting": (
+            "QMIX: none; MASIA: point-to-point expansion of each sender "
+            "broadcast, local observation float32 payload; MATCH family: "
+            "fixed 12x8 float32 uplink plus personalized 32-float downlink."
+        ),
     }
     for key, value in report.items():
         if isinstance(value, float) and not math.isfinite(value):
@@ -161,9 +267,8 @@ def main() -> None:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    output_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
-    env.close()
 
 
 if __name__ == "__main__":

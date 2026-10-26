@@ -37,7 +37,7 @@ Invisible improves POL over MATCH by **15.2 percentage points on CN5** and
 - BeliefHub-All and BeliefHub-Invisible
 - NoFusion-All and NoFusion-Invisible
 - NoHistory and `lambda_B = 0` ablations
-- QMIX and MASIA model/learner components used by the comparison pipeline
+- QMIX and MASIA, including CN5/CN6 training entry points
 
 ## Environment
 
@@ -226,9 +226,10 @@ Use `evaluate_match_cn5.py` for CN5. The evaluator restores belief architecture,
 fusion/history flags, and sight range from checkpoint arguments. It uses the
 saved packet-loss rate unless `--packet-loss` overrides it.
 
-The command above is a standalone 500-episode evaluation. The current evaluator
-does not expose a separate 20-episode warm-up option, so this command alone does
-not implement the manuscript's exact main CN6 evaluation protocol.
+The command above is a standalone 500-episode evaluation. It does not implement
+the manuscript's main CN6 protocol. The original CUDA benchmark entry point,
+`scripts/analysis/benchmark_cn6_inference.py`, supports 20 warm-up episodes and
+200 test episodes with base seed 40000. See [REPRODUCIBILITY.md](REPRODUCIBILITY.md).
 
 For an execution-time loss sweep on a CN6 checkpoint:
 
@@ -247,10 +248,10 @@ episodes for one checkpoint, not variability across training seeds. To compare
 with five-seed paper tables, aggregate per-checkpoint means across five
 independently trained seeds.
 
-The current evaluator reads sight range from the checkpoint and has no
-`--sight-range` override. The manuscript's full 11 × 11 sight–loss grid therefore
-requires an additional evaluation entry point or extension; the loss sweep above
-does not reproduce that grid.
+The simple evaluator above reads sight range from the checkpoint. For sight
+and loss overrides, use `evaluate_cn6_dense_grid_checkpoint.py`. The original
+11 × 11 grid launcher is `run_cn6_dense_grid_500ep.sh`; see
+[REPRODUCIBILITY.md](REPRODUCIBILITY.md) for checkpoint paths and commands.
 
 ## Implementation map
 
@@ -279,22 +280,32 @@ scripts/        Retained experiment and analysis utilities
 
 ## Reproduction scope and available artifacts
 
-- CN5/CN6 training and evaluation entry points are included for MATCH and the
-  BeliefHub variants.
-- QMIX and MASIA model/learner components are included; standalone baseline
-  training entry points are not included in this snapshot.
-- Checkpoints, original per-seed logs, and raw sight–loss grid results are not
-  distributed in this snapshot. The result table above records manuscript
-  values rather than independently verified outputs of this snapshot.
-- Retained analysis utilities may contain project-specific input paths and
-  assumptions; inspect them before use. They are not a single-command
-  reproduction pipeline.
+- Training entry points are included for all five methods on CN5/CN6.
+- Baseline and grid evaluation commands, archived result summaries, checkpoint
+  metadata, and verification limits are documented in
+  [REPRODUCIBILITY.md](REPRODUCIBILITY.md).
+- The CN5 environment agent count in `train_match_cn5.py` is fixed to five.
+- Full checkpoints and large original experiment outputs are not bundled.
+  The compact `reproduction_results/` files summarize the recovered archive.
+- Seven main CN6 checkpoints record resumed training. Evaluation from these
+  archived weights has been checked; statistical reproduction by training all
+  configurations from scratch has not been established.
 - SMAC-related source files and CN8 exploratory utilities are outside the
   submitted paper's CN5/CN6 evidence.
 
-## Status
+## Verification status
 
-This package consolidates the complete retained training implementation used
-throughout the project. Checkpoints and large experiment outputs are excluded.
-Run a final end-to-end reproduction pass before creating a public archival tag.
+CN5/CN6 MATCH and BeliefHub short training, checkpoint saving/loading, and
+evaluation pipelines passed on CPU. The four QMIX/MASIA training and evaluation
+entry points also passed short pipeline checks.
+
+Archived CN5 last-ten-evaluation summaries match the manuscript at its reported
+precision. All 1,815 grid episode CSVs (907,500 episodes) agree with their summary
+means, and the grid gains match the manuscript's reported values.
+
+All 50 final checkpoints load into execution networks. An independent CPU
+re-evaluation of all 25 CN6 checkpoints used 20 warm-up and 200 test episodes
+per checkpoint. The results are close to, but not identical to, the submitted
+CUDA results. These checks do not constitute a complete from-scratch training
+reproduction. See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for detailed results.
 
