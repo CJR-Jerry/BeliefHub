@@ -136,8 +136,13 @@ python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/
 python -m pip install -r requirements.txt
 ```
 
-The experiments were run with PyTorch 2.5.1+cu121, Gymnasium 0.29.1, and
-PettingZoo 1.24.3.
+The paper experiments were run on Linux with NVIDIA GeForce RTX 3090
+GPUs (24 GB VRAM), using PyTorch 2.5.1+cu121, Gymnasium 0.29.1,
+and PettingZoo 1.24.3.
+
+Linux with an NVIDIA GPU is recommended for full training.
+Windows CPU checkpoint evaluation has also been tested.
+
 Use a Python version supported by these pinned packages (for example Python 3.10).
 For a CPU environment, install an appropriate CPU build of PyTorch instead.
 The training/evaluation entry points select CUDA when available and otherwise CPU.
