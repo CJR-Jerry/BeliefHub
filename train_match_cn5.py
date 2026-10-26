@@ -375,7 +375,7 @@ def main():
     )
 
     env = CooperativeNavigation(
-        n_agents=6,
+        n_agents=5,
         max_cycles=25,
         occupancy_radius=0.3,
     )
